@@ -1,0 +1,1 @@
+python bench_xgb.py --device cpu
