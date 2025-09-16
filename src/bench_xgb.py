@@ -7,17 +7,28 @@ import sys
 import time
 import platform
 from pathlib import Path
+from tqdm import tqdm
+from multiprocessing import get_context
+
 
 import numpy as np
+import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss
 import xgboost as xgb
+
 
 from configs import get_config
 
 from utils import (
     make_synthetic_binary,
-    build_train_test_dmatrices
+    build_train_test_dmatrices,
+    get_system_info
 )
+
+
+def worker(q, args, config):
+    times = one_run(args=args, config=config)
+    q.put(times)
 
 class IterTimer(xgb.callback.TrainingCallback):
     def __init__(self):
@@ -75,18 +86,15 @@ def summarize_env():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
-def main():
-    parser = argparse.ArgumentParser(description="XGBoost CPU and single GPU timing benchmark")
-    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-
-    parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
-    args = parser.parse_args()
+def one_run(
+    args,
+    config,
+):
     
-    config = get_config()
- 
-    print("\nBenchmark configuration")
+    # print("\nBenchmark configuration")
     # log these configurations
-    print(json.dumps(vars(args), indent=2))
+    # print(json.dumps(vars(args), indent=2))
+
 
     # data generation
     t0 = time.perf_counter()
@@ -97,33 +105,37 @@ def main():
     )
     t1 = time.perf_counter()
     gen_time = t1 - t0
-    print(f"\nsynthetic data generated in {gen_time:.3f} s")
+    # print(f"\nsynthetic data generated in {gen_time:.3f} s")
 
     # DMatrix construction
     dtrain, dtest, times = build_train_test_dmatrices(
         X, y, test_pct=config.sample.test_size, seed=config.sample.random_state, gpu=(args.device == "gpu")
     )
-    print(f"DMatrix construction time {times['dmatrix_train_s'] + times['dmatrix_test_s']:.3f} s")
+    # print(f"DMatrix construction time {times['dmatrix_train_s'] + times['dmatrix_test_s']:.3f} s")
     del X, y; gc.collect()  # encourage memory release if possible
-   
+
     # params
     params = {**config.common, **(config.cpu if args.device == "cpu" else config.gpu)}
+    
+    if args.device == "cpu":
+        
+        params["nthread"] = args.threads
    
     # one step timing for warmup
     _, one_step_time, one_step_per_iter = run_training_once(
         params, dtrain, config.common.num_boost_round, do_one_step=True
     )
 
-    print(f"\none boosting step wall time {one_step_time:.3f} s")
+    # print(f"\none boosting step wall time {one_step_time:.3f} s")
 
     # full training timing
     booster, full_total, per_iter_times = run_training_once(
         params, dtrain, config.common.num_boost_round, do_one_step=False
     )
-    print(f"Full training wall time for {config.common.num_boost_round} rounds {full_total:.3f} s")
+    # print(f"Full training wall time for {config.common.num_boost_round} rounds {full_total:.3f} s")
 
-    if per_iter_times:
-        print(f"First five per iteration times {per_iter_times[:5]}")
+    # if per_iter_times:
+    #     print(f"First five per iteration times {per_iter_times[:5]}")
 
     if args.device == "gpu":
         booster.set_param({"predictor": "gpu_predictor"})
@@ -143,25 +155,70 @@ def main():
     test_logloss = log_loss(y_true, y_prob, labels=[0.0, 1.0])
 
     acc = accuracy_score(y_true, y_pred)
-    print(f"test prediction time {tp1 - tp0:.3f} s | test accuracy {acc:.4f}")
+    # print(f"test prediction time {tp1 - tp0:.3f} s | test accuracy {acc:.4f}")
 
+    avg_per_iter = np.mean(per_iter_times)
+    std_per_iter = np.std(per_iter_times) if len(per_iter_times) > 1 else 0.0
+    median_per_iter = np.median(per_iter_times) if len(per_iter_times) > 0 else 0.0
 
-    # report and persist summary
-    summary = {
-        "env": summarize_env(),
-        "config": vars(args),
-        "times": {
+    times = {
             "data_gen_s": gen_time,
             "one_step_train_s": one_step_time,
             "full_train_total_s": full_total,
-            "per_iter_s": per_iter_times,
+            "per_iter_s": avg_per_iter,
+            "per_iter_s_std": std_per_iter,
+            "per_iter_s_median": median_per_iter,
             "validation_logloss": float(acc),
             "predict_test": tp1 - tp0,
             "predict_train": trp1 - trp0,
             "train_logloss": float(train_logloss),
             "test_logloss": float(test_logloss),
+            
         }
+    return times
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="XGBoost CPU and single GPU timing benchmark")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
+
+    parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
+    parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
+    parser.add_argument("--threads", type=int, default=5, help="number of threads for CPU runs")
+    args = parser.parse_args()
+    
+    if args.device == "cpu":
+        os.environ["OMP_NUM_THREADS"] = str(args.threads)
+
+    config = get_config()
+    ctx = get_context("spawn")
+
+    time_stats = []
+    for _ in tqdm(range(args.n_runs), total=args.n_runs):
+    #     times = one_run(args=args, config=config)
+    #     time_stats.append(times)
+        # print(times, "\n")
+
+        q = ctx.Queue()
+        p = ctx.Process(target=worker, args=(q, args, config))
+        p.start()
+        result = q.get()
+        p.join()
+        if p.exitcode != 0:
+            raise SystemExit(f"Run failed with exit code {p.exitcode}")
+        time_stats.append(result)
+
+    # report and persist summary
+    summary = {
+        "env": summarize_env(),
+        "system": get_system_info(),
+        "config": vars(args),
     }
+
+    df = pd.DataFrame(time_stats)
+    df.to_csv("benchmark_detailed_times.csv", index=False)
+
     with open(args.summary_json, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nwrote summary to {args.summary_json}")

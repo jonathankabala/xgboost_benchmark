@@ -4,6 +4,10 @@ import time, gc
 import xgboost as xgb
 from sklearn.model_selection import StratifiedShuffleSplit
 import numpy as np
+import platform
+import psutil
+import cpuinfo
+import GPUtil
 
 def make_synthetic_binary(
     n_samples: int,
@@ -52,10 +56,6 @@ def build_dmatrix(X, y):
     return dtrain, t1 - t0
 
 
-import numpy as np
-import time
-import xgboost as xgb
-
 
 def build_train_test_dmatrices(
     X,
@@ -100,3 +100,50 @@ def build_train_test_dmatrices(
     times["test_pct"] = float(test_pct)
     
     return dtrain, dtest, times
+
+
+def get_system_info():
+    info = {}
+
+    # Basic system/platform info
+    info["System"] = platform.system()
+    info["Node Name"] = platform.node()
+    info["Release"] = platform.release()
+    info["Version"] = platform.version()
+    info["Machine"] = platform.machine()
+    info["Processor"] = platform.processor()
+
+    # CPU details
+    cpu_info = cpuinfo.get_cpu_info()
+    info["CPU Brand"] = cpu_info.get("brand_raw", "N/A")
+    info["Architecture"] = cpu_info.get("arch", "N/A")
+    info["Bits"] = cpu_info.get("bits", "N/A")
+    info["Count (logical)"] = psutil.cpu_count(logical=True)
+    info["Count (physical)"] = psutil.cpu_count(logical=False)
+    freq = psutil.cpu_freq()
+    if freq:
+        info["Max Frequency (MHz)"] = freq.max
+        info["Min Frequency (MHz)"] = freq.min
+        info["Current Frequency (MHz)"] = freq.current
+    info["Total CPU Usage (%)"] = psutil.cpu_percent()
+
+    # Memory info
+    svmem = psutil.virtual_memory()
+    info["Total Memory (GB)"] = round(svmem.total / (1024**3), 2)
+    info["Available Memory (GB)"] = round(svmem.available / (1024**3), 2)
+
+    # GPU info (if NVIDIA GPU is available)
+    try:
+        gpus = GPUtil.getGPUs()
+        for i, gpu in enumerate(gpus):
+            info[f"GPU {i} Name"] = gpu.name
+            info[f"GPU {i} Driver"] = gpu.driver
+            info[f"GPU {i} Memory Total (MB)"] = gpu.memoryTotal
+            # info[f"GPU {i} Memory Used (MB)"] = gpu.memoryUsed
+            info[f"GPU {i} Memory Free (MB)"] = f"{gpu.memoryFree}"
+            # info[f"GPU {i} Utilization (%)"] = gpu.load * 100
+            # info[f"GPU {i} Temperature (°C)"] = gpu.temperature
+    except Exception as e:
+        info["GPU Info"] = f"Could not retrieve GPU info ({e})"
+
+    return info
