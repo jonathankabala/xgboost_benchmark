@@ -26,9 +26,32 @@ from utils import (
 )
 
 
+# def worker(q, args, config):
+#     times = one_run(args=args, config=config)
+#     q.put(times)
+
 def worker(q, args, config):
+    # ----- stability preamble -----
+    try:
+        import psutil, os
+        if getattr(args, "core_start", None) is not None:
+            cores = list(range(args.core_start, args.core_start + args.threads))
+            psutil.Process(os.getpid()).cpu_affinity(cores)
+            os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, cores))
+    except Exception:
+        pass
+
+    os.environ.setdefault("OMP_PROC_BIND", "true")
+    os.environ.setdefault("OMP_PLACES", "cores")
+    os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "1")
+
+    # Optional: short, consistent pause between runs
+    time.sleep(0.3)
+    # --------------------------------
     times = one_run(args=args, config=config)
     q.put(times)
+
 
 class IterTimer(xgb.callback.TrainingCallback):
     def __init__(self):
@@ -132,6 +155,20 @@ def one_run(
     booster, full_total, per_iter_times = run_training_once(
         params, dtrain, config.common.num_boost_round, do_one_step=False
     )
+
+    if args.device == "gpu":
+        _ = run_training_once(params, dtrain, 2, do_one_step=False)
+
+    # ----- measured run with GC disabled -----
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        booster, full_total, per_iter_times = run_training_once(
+            params, dtrain, config.common.num_boost_round, do_one_step=False
+        )
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     # print(f"Full training wall time for {config.common.num_boost_round} rounds {full_total:.3f} s")
 
     # if per_iter_times:
@@ -190,6 +227,7 @@ def main():
     
     if args.device == "cpu":
         os.environ["OMP_NUM_THREADS"] = str(args.threads)
+        
 
     config = get_config()
     ctx = get_context("spawn")
