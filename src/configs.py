@@ -43,6 +43,6 @@ def get_config():
 
     config.gpu = ConfigDict()
     config.gpu.device = 0
-    config.gpu.tree_method = 'gpu_hist'
+    config.gpu.tree_method = 'gpu_hist' # this is deprecated for newer version of xgboost
 
     return config

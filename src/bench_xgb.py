@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import sys
+import psutil
 import time
 import platform
 from pathlib import Path
@@ -54,8 +55,9 @@ from utils import (
 
 
 def worker(q, args, config):
-    import os, time, psutil
-    
+    """
+    CPU worker (respects core pinning and BLAS/OMP isolation).
+    """
     if args.device == "cpu":
         os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
         os.environ.setdefault("OMP_PROC_BIND", "true")
@@ -69,7 +71,7 @@ def worker(q, args, config):
             os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
     try:
-        if getattr(args, "core_start", None) is not None:
+        if getattr(args, "core_start", None) is not None and args.device == "cpu":
             cores = list(range(args.core_start, args.core_start + args.threads))
             psutil.Process(os.getpid()).cpu_affinity(cores)
             os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, cores))
@@ -78,10 +80,41 @@ def worker(q, args, config):
     except Exception:
         pass
 
-    time.sleep(0.3)  # let OS settle
+    time.sleep(0.2)  # tiny settle
     times = one_run(args=args, config=config)
     q.put(times)
 
+
+def gpu_worker(q, args, config, gpu_id: int):
+    """
+    GPU worker. Hard-isolate to a single GPU via CUDA_VISIBLE_DEVICES.
+    inside this process, that GPU is ordinal 0; we set params['device']='cuda:0'.
+    """
+    # stable device ordering + hard isolation
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # avoid cross-GPU fabric probing (we're single-GPU per process)
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+
+    # set niceness if requested
+    try:
+        if args.nice is not None:
+            psutil.Process(os.getpid()).nice(args.nice)
+    except Exception:
+        pass
+
+    # clone args minimally without mutating parent
+    # we don't need argparse.Namespace here—just change the device view.
+    class A: pass
+    args_local = A()
+    for k, v in vars(args).items():
+        setattr(args_local, k, v)
+    args_local.device = "gpu"
+
+    time.sleep(0.2)
+    times = one_run(args=args_local, config=config)
+    q.put(times)
 
 
 # class IterTimer(xgb.callback.TrainingCallback):
@@ -183,17 +216,25 @@ def one_run(
     del X, y; gc.collect()  # encourage memory release if possible
 
     # params
-    params = {**config.common, **(config.cpu if args.device == "cpu" else config.gpu)}
+    # params = {**config.common, **(config.cpu if args.device == "cpu" else config.gpu)}
     
+    # if args.device == "cpu":
+    #     params["nthread"] = args.threads
+
+    params = {**config.common, **(config.cpu if args.device == "cpu" else config.gpu)}
+    params.setdefault("tree_method", "hist")
     if args.device == "cpu":
         params["nthread"] = args.threads
-   
+        
+    else:
+        # we isolate each worker with CUDA_VISIBLE_DEVICES to one GPU.
+        # inside the child process, the single visible device is ordinal 0.
+        params["device"] = "cuda:0"           # or simply "cuda" in this isolated context
+
     # one step timing for warmup
     _, one_step_time, one_step_per_iter = run_training_once(
         params, dtrain, 5, do_one_step=False
     )
-
-    # print(f"\none boosting step wall time {one_step_time:.3f} s")
 
     # ----- measured run with GC disabled -----
     gc_was_enabled = gc.isenabled()
@@ -259,58 +300,102 @@ def one_run(
     }
 
 
+    # proactively release GPU memory at end of run
+    del booster, dtrain, dtest
+    gc.collect()
+
     return times
 
-
 def run_cpu_benchmark(args, config):
-
     if args.device == "cpu":
         os.environ["OMP_NUM_THREADS"] = str(args.threads)
-        
+
     ctx = get_context("spawn")
-
     time_stats = []
-    for _ in tqdm(range(args.n_runs), total=args.n_runs):
-    #     times = one_run(args=args, config=config)
-    #     time_stats.append(times)
-        # print(times, "\n")
+    with tqdm(total=args.n_runs, desc="CPU runs", leave=False) as pbar:
+        for _ in range(args.n_runs):
+            q = ctx.Queue()
+            p = ctx.Process(target=worker, args=(q, args, config))
+            p.start()
+            result = q.get()
+            p.join()
+            if p.exitcode != 0:
+                raise SystemExit(f"Run failed with exit code {p.exitcode}")
+            time_stats.append(result)
+            pbar.update(1)
 
+    return time_stats
+
+
+
+
+def run_gpu_benchmark(args, config, num_gpus: int = 4):
+    """
+    run args.n_runs total, with up to num_gpus runs in parallel.
+    rach run gets a unique GPU by masking visibility to that device.
+    """
+    ctx = get_context("spawn")
+    time_stats = []
+    in_flight = []  # list[(Process, Queue, gpu_id)]
+    launched = 0
+    next_gpu = 0
+
+    def launch(gid):
         q = ctx.Queue()
-        p = ctx.Process(target=worker, args=(q, args, config))
+        p = ctx.Process(target=gpu_worker, args=(q, args, config, gid))
         p.start()
-        result = q.get()
-        p.join()
-        if p.exitcode != 0:
-            raise SystemExit(f"Run failed with exit code {p.exitcode}")
-        time_stats.append(result)
+        in_flight.append((p, q, gid))
+
+    with tqdm(total=args.n_runs, desc="GPU runs", leave=False) as pbar:
+        # prime up to num_gpus workers
+        while launched < args.n_runs and len(in_flight) < num_gpus:
+            launch(next_gpu % num_gpus)
+            launched += 1
+            next_gpu += 1
+
+        # collect/refill loop
+        while in_flight:
+            p, q, gid = in_flight.pop(0)
+            result = q.get()  # wait for that worker
+            p.join()
+            if p.exitcode != 0:
+                raise SystemExit(f"GPU run on device {gid} failed with exit code {p.exitcode}")
+            time_stats.append(result)
+            pbar.update(1)
+
+            if launched < args.n_runs:
+                launch(next_gpu % num_gpus)
+                launched += 1
+                next_gpu += 1
 
     return time_stats
 
 def main():
 
-    parser = argparse.ArgumentParser(description="XGBoost CPU and single GPU timing benchmark")
+    parser = argparse.ArgumentParser(description="XGBoost CPU and single-GPU timing benchmark")
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-
     parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
     parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
-    parser.add_argument("--threads", type=int, default=5, help="number of threads for CPU runs")
+    parser.add_argument("--threads", type=int, default=5, help="threads per CPU run")
 
     parser.add_argument("--core-start", type=int, default=0,
-                    help="first core index to pin the worker+threads")
+                        help="first core index to pin the worker+threads (CPU only)")
     parser.add_argument("--isolate-blas", action="store_true",
-                        help="force single-thread BLAS during DMatrix prep")
+                        help="force single-thread BLAS during DMatrix prep (CPU only)")
     parser.add_argument("--nice", type=int, default=None,
-                    help="set process niceness (lower is higher priority)")
+                        help="set process niceness (lower is higher priority)")
+    parser.add_argument("--n-gpus", type=int, default=4,
+                        help="number of GPUs to use concurrently for GPU mode")
 
     args = parser.parse_args()
-    
     config = get_config()
 
-    time_stats = {}
+
     if args.device == "cpu":
         time_stats = run_cpu_benchmark(args, config)
-    elif args.device == "gpu":
-        pass
+    else:
+        # run with up to args.n_gpus (i.e., 4) GPUs in parallel (configurable via --n-gpus)
+        time_stats = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
 
     # report and persist summary
     summary = {
@@ -320,11 +405,15 @@ def main():
     }
 
     df = pd.DataFrame(time_stats)
-    df.to_csv("benchmark_detailed_times.csv", index=False)
+    benchmark_detailed_file = f"{args.device}_benchmark_detailed_times.csv"
+    df.to_csv(benchmark_detailed_file, index=False)
 
-    with open(args.summary_json, "w") as f:
+    with open(f"{args.device}_{args.summary_json}", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nwrote summary to {args.summary_json}")
+
+    print(f"\nwrote summary to {args.summary_json}")
+    print(f"wrote per-run details to {benchmark_detailed_file}")
 
 if __name__ == "__main__":
     main()
