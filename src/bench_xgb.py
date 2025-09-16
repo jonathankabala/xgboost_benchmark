@@ -30,43 +30,88 @@ from utils import (
 #     times = one_run(args=args, config=config)
 #     q.put(times)
 
+# def worker(q, args, config):
+#     # ----- stability preamble -----
+#     try:
+#         import psutil, os
+#         if getattr(args, "core_start", None) is not None:
+#             cores = list(range(args.core_start, args.core_start + args.threads))
+#             psutil.Process(os.getpid()).cpu_affinity(cores)
+#             os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, cores))
+#     except Exception:
+#         pass
+
+#     os.environ.setdefault("OMP_PROC_BIND", "true")
+#     os.environ.setdefault("OMP_PLACES", "cores")
+#     os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
+#     os.environ.setdefault("MALLOC_ARENA_MAX", "1")
+
+#     # Optional: short, consistent pause between runs
+#     time.sleep(0.3)
+#     # --------------------------------
+#     times = one_run(args=args, config=config)
+#     q.put(times)
+
+
 def worker(q, args, config):
-    # ----- stability preamble -----
+    import os, time, psutil
+    
+    if args.device == "cpu":
+        os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
+        os.environ.setdefault("OMP_PROC_BIND", "true")
+        os.environ.setdefault("OMP_PLACES", "cores")
+        os.environ.setdefault("OMP_DYNAMIC", "false")
+        os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
+        os.environ.setdefault("MALLOC_ARENA_MAX", "1")
+        if args.isolate_blas:
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
+            os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
     try:
-        import psutil, os
         if getattr(args, "core_start", None) is not None:
             cores = list(range(args.core_start, args.core_start + args.threads))
             psutil.Process(os.getpid()).cpu_affinity(cores)
             os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, cores))
+        if args.nice is not None:
+            psutil.Process(os.getpid()).nice(args.nice)
     except Exception:
         pass
 
-    os.environ.setdefault("OMP_PROC_BIND", "true")
-    os.environ.setdefault("OMP_PLACES", "cores")
-    os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
-    os.environ.setdefault("MALLOC_ARENA_MAX", "1")
-
-    # Optional: short, consistent pause between runs
-    time.sleep(0.3)
-    # --------------------------------
+    time.sleep(0.3)  # let OS settle
     times = one_run(args=args, config=config)
     q.put(times)
 
 
-class IterTimer(xgb.callback.TrainingCallback):
-    def __init__(self):
-        self.iter_times = []
-        self._t0 = None
 
+# class IterTimer(xgb.callback.TrainingCallback):
+#     def __init__(self):
+#         self.iter_times = []
+#         self._t0 = None
+
+#     def before_training(self, model):
+#         self.iter_times.clear()
+#         self._t0 = None
+#         return model
+
+#     def after_iteration(self, model, epoch: int, evals_log: dict):
+#         t1 = time.perf_counter()
+#         if self._t0 is not None:
+#             self.iter_times.append(t1 - self._t0)
+#         self._t0 = time.perf_counter()
+#         return False
+    
+class IterTimer(xgb.callback.TrainingCallback):
+    def __init__(self): 
+        self.iter_times = []; 
+        self._t0 = None
     def before_training(self, model):
         self.iter_times.clear()
-        self._t0 = None
+        self._t0 = time.perf_counter()
         return model
-
     def after_iteration(self, model, epoch: int, evals_log: dict):
         t1 = time.perf_counter()
-        if self._t0 is not None:
-            self.iter_times.append(t1 - self._t0)
+        self.iter_times.append(t1 - self._t0)
         self._t0 = time.perf_counter()
         return False
 
@@ -141,23 +186,14 @@ def one_run(
     params = {**config.common, **(config.cpu if args.device == "cpu" else config.gpu)}
     
     if args.device == "cpu":
-        
         params["nthread"] = args.threads
    
     # one step timing for warmup
     _, one_step_time, one_step_per_iter = run_training_once(
-        params, dtrain, config.common.num_boost_round, do_one_step=True
+        params, dtrain, 5, do_one_step=False
     )
 
     # print(f"\none boosting step wall time {one_step_time:.3f} s")
-
-    # full training timing
-    booster, full_total, per_iter_times = run_training_once(
-        params, dtrain, config.common.num_boost_round, do_one_step=False
-    )
-
-    if args.device == "gpu":
-        _ = run_training_once(params, dtrain, 2, do_one_step=False)
 
     # ----- measured run with GC disabled -----
     gc_was_enabled = gc.isenabled()
@@ -198,38 +234,39 @@ def one_run(
     std_per_iter = np.std(per_iter_times) if len(per_iter_times) > 1 else 0.0
     median_per_iter = np.median(per_iter_times) if len(per_iter_times) > 0 else 0.0
 
+
+    num_rounds = config.common.num_boost_round
+    boosts_per_sec_total = num_rounds / full_total
+    boosts_per_sec_mean = 1.0 / avg_per_iter if avg_per_iter > 0 else 0.0
+    boosts_per_sec_median = 1.0 / median_per_iter if median_per_iter > 0 else 0.0
+
+
     times = {
-            "data_gen_s": gen_time,
-            "one_step_train_s": one_step_time,
-            "full_train_total_s": full_total,
-            "per_iter_s": avg_per_iter,
-            "per_iter_s_std": std_per_iter,
-            "per_iter_s_median": median_per_iter,
-            "validation_logloss": float(acc),
-            "predict_test": tp1 - tp0,
-            "predict_train": trp1 - trp0,
-            "train_logloss": float(train_logloss),
-            "test_logloss": float(test_logloss),
-            
-        }
+        "data_gen_s": gen_time,
+        "one_step_train_s": one_step_time,
+        "full_train_total_s": full_total,
+        "per_iter_s": avg_per_iter,
+        "per_iter_s_std": std_per_iter,
+        "per_iter_s_median": median_per_iter,
+        "boosts_per_sec_total": boosts_per_sec_total,
+        "boosts_per_sec_mean": boosts_per_sec_mean,
+        "boosts_per_sec_median": boosts_per_sec_median,
+        "test_accuracy": float(acc),
+        "predict_test": tp1 - tp0,
+        "predict_train": trp1 - trp0,
+        "train_logloss": float(train_logloss),
+        "test_logloss": float(test_logloss),
+    }
+
+
     return times
 
 
-def main():
+def run_cpu_benchmark(args, config):
 
-    parser = argparse.ArgumentParser(description="XGBoost CPU and single GPU timing benchmark")
-    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-
-    parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
-    parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
-    parser.add_argument("--threads", type=int, default=5, help="number of threads for CPU runs")
-    args = parser.parse_args()
-    
     if args.device == "cpu":
         os.environ["OMP_NUM_THREADS"] = str(args.threads)
         
-
-    config = get_config()
     ctx = get_context("spawn")
 
     time_stats = []
@@ -246,6 +283,34 @@ def main():
         if p.exitcode != 0:
             raise SystemExit(f"Run failed with exit code {p.exitcode}")
         time_stats.append(result)
+
+    return time_stats
+
+def main():
+
+    parser = argparse.ArgumentParser(description="XGBoost CPU and single GPU timing benchmark")
+    parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
+
+    parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
+    parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
+    parser.add_argument("--threads", type=int, default=5, help="number of threads for CPU runs")
+
+    parser.add_argument("--core-start", type=int, default=0,
+                    help="first core index to pin the worker+threads")
+    parser.add_argument("--isolate-blas", action="store_true",
+                        help="force single-thread BLAS during DMatrix prep")
+    parser.add_argument("--nice", type=int, default=None,
+                    help="set process niceness (lower is higher priority)")
+
+    args = parser.parse_args()
+    
+    config = get_config()
+
+    time_stats = {}
+    if args.device == "cpu":
+        time_stats = run_cpu_benchmark(args, config)
+    elif args.device == "gpu":
+        pass
 
     # report and persist summary
     summary = {
