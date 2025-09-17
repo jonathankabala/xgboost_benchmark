@@ -78,6 +78,6 @@ ENV/
 
 # Benchmark output
 src/benchmark_summary.json
-src/log
-misc.py
+src/logs_dev
 secret.txt
+misc.py

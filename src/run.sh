@@ -1,1 +1,1 @@
-python bench_xgb.py --device cpu --n-runs 15 --threads 8
+python bench_xgb.py --device cpu --n-runs 2 --threads 8
