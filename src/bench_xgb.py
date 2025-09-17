@@ -18,11 +18,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss
 import xgboost as xgb
+import h2o
 
 
 from configs import get_config
 
 from pyxboost_exp import py_one_run
+from h2o_xgboost_exp import h2o_one_run
 from utils import (
     get_system_info
 )
@@ -178,9 +180,21 @@ def main():
     parser = argparse.ArgumentParser(description="XGBoost CPU and single-GPU timing benchmark")
     parser.add_argument("--experiment-type", choices=["pyxgboost", "h2oxgboost"], default="pyxgboost")
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-    # parser.add_argument("--summary-json", type=str, default="benchmark_summary.json")
 
     parser.add_argument("--out-dir", type=str, default="logs_dev", help="output directory")
+    parser.add_argument(
+        "--load-data",
+        action="store_true",
+        help="load data instead of creating it"
+    )
+
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data",
+        help="directory to load data from"
+    )
+
     parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
     parser.add_argument("--threads", type=int, default=5, help="threads per CPU run")
 
@@ -196,17 +210,19 @@ def main():
     args = parser.parse_args()
     config = get_config()
 
-    if args.experiment_type == "pyxgboost":
-        if args.device == "cpu":
-            time_stats = run_cpu_benchmark(args, config)
-        else:
-            # run with up to args.n_gpus (i.e., 4) GPUs in parallel (configurable via --n-gpus)
-            time_stats = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
-    elif args.experiment_type == "h2oxgboost":
-        raise NotImplementedError("h2oxgboost benchmark not implemented yet")
-    else:
-        raise ValueError(f"unknown experiment type {args.experiment_type}")
+    if args.experiment_type == "h2oxgboost":
+        h2o.init()
 
+    h2o_one_run(args, config)
+
+    import ipdb
+    ipdb.set_trace()
+    
+    if args.device == "cpu":
+        time_stats = run_cpu_benchmark(args, config)
+    else:
+        # run with up to args.n_gpus (i.e., 4) GPUs in parallel (configurable via --n-gpus)
+        time_stats = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
    
     austin_tz = ZoneInfo("America/Chicago")
     current_time = datetime.now(austin_tz)
