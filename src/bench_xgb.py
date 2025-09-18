@@ -26,11 +26,20 @@ from configs import get_config
 from pyxboost_exp import py_one_run
 from h2o_xgboost_exp import h2o_one_run
 from utils import (
-    get_system_info
+    get_system_info,
+    summarize_env
 )
 
 
-def worker(q, args, config):
+def _ensure_h2o():
+    try:
+        # connects to a running cluster at default http://localhost:54321
+        h2o.connect()  
+    except Exception:
+        # if nothing is running yet, start one
+        h2o.init(ip="localhost", port=54321)
+
+def cpu_worker(q, args, config):
     """
     CPU worker (respects core pinning and BLAS/OMP isolation).
     """
@@ -58,18 +67,21 @@ def worker(q, args, config):
 
     time.sleep(0.2)  # tiny settle
 
+    if args.experiment_type == "h2oxgboost":
+        _ensure_h2o() # i just want to connect to the parent cluster that I started with h2o.init()
+
     if args.experiment_type == "pyxgboost":
-        times = py_one_run(args=args, config=config)
+        times, model_params = py_one_run(args=args, config=config)
     elif args.experiment_type == "h2oxgboost":
-        raise NotImplementedError("h2oxgboost benchmark not implemented yet")
+        times, model_params = h2o_one_run(args=args, config=config)
     else:
         raise ValueError(f"unknown experiment type {args.experiment_type}")
-    
-    q.put(times)
+
+    q.put((times, model_params))
 
 def gpu_worker(q, args, config, gpu_id: int):
     """
-    GPU worker. Hard-isolate to a single GPU via CUDA_VISIBLE_DEVICES.
+    GPU worker. hard-isolate to a single GPU via CUDA_VISIBLE_DEVICES.
     inside this process, that GPU is ordinal 0; we set params['device']='cuda:0'.
     """
     # stable device ordering + hard isolation
@@ -95,24 +107,17 @@ def gpu_worker(q, args, config, gpu_id: int):
     args_local.device = "gpu"
 
     time.sleep(0.2)
+
+    if args.experiment_type == "h2oxgboost":
+        _ensure_h2o() # i just want to connect to the parent cluster that I started with h2o.init()
+
     if args.experiment_type == "pyxgboost":
-        times = py_one_run(args=args_local, config=config)
+        times, model_params = py_one_run(args=args_local, config=config)
     elif args.experiment_type == "h2oxgboost":
-        raise NotImplementedError("h2oxgboost benchmark not implemented yet")
+        times, model_params = h2o_one_run(args=args_local, config=config)
     else:
         raise ValueError(f"unknown experiment type {args.experiment_type}")
-    q.put(times)
-
-def summarize_env():
-    return {
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "numpy": np.__version__,
-        "xgboost": xgb.__version__,
-        "omp_threads_env": os.environ.get("OMP_NUM_THREADS"),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-    }
-
+    q.put((times, model_params))
 
 def run_cpu_benchmark(args, config):
     if args.device == "cpu":
@@ -123,21 +128,21 @@ def run_cpu_benchmark(args, config):
     with tqdm(total=args.n_runs, desc="CPU runs", leave=False) as pbar:
         for _ in range(args.n_runs):
             q = ctx.Queue()
-            p = ctx.Process(target=worker, args=(q, args, config))
+            p = ctx.Process(target=cpu_worker, args=(q, args, config))
             p.start()
-            result = q.get()
+            result, model_params = q.get()
             p.join()
             if p.exitcode != 0:
-                raise SystemExit(f"Run failed with exit code {p.exitcode}")
+                raise SystemExit(f"CPU run failed with exit code {p.exitcode}")
             time_stats.append(result)
             pbar.update(1)
 
-    return time_stats
+    return time_stats, model_params
 
 def run_gpu_benchmark(args, config, num_gpus: int = 4):
     """
     run args.n_runs total, with up to num_gpus runs in parallel.
-    rach run gets a unique GPU by masking visibility to that device.
+    each run gets a unique GPU by masking visibility to that device.
     """
     ctx = get_context("spawn")
     time_stats = []
@@ -161,7 +166,7 @@ def run_gpu_benchmark(args, config, num_gpus: int = 4):
         # collect/refill loop
         while in_flight:
             p, q, gid = in_flight.pop(0)
-            result = q.get()  # wait for that worker
+            result, model_params = q.get()  # wait for that worker
             p.join()
             if p.exitcode != 0:
                 raise SystemExit(f"GPU run on device {gid} failed with exit code {p.exitcode}")
@@ -173,7 +178,7 @@ def run_gpu_benchmark(args, config, num_gpus: int = 4):
                 launched += 1
                 next_gpu += 1
 
-    return time_stats
+    return time_stats, model_params
 
 def main():
 
@@ -213,17 +218,29 @@ def main():
     if args.experiment_type == "h2oxgboost":
         h2o.init()
 
-    h2o_one_run(args, config)
+    # py_one_run(args=args, config=config)
 
-    import ipdb
-    ipdb.set_trace()
+    # h2o_one_run(args, config)
+
+    # import ipdb
+    # ipdb.set_trace()
+
+    # class A: pass
+    # args_local = A()
+    # for k, v in vars(args).items():
+    #     setattr(args_local, k, v)
+    # args_local.device = "gpu"
+    # times = py_one_run(args=args_local, config=config)
+
+    # import ipdb
+    # ipdb.set_trace()
     
     if args.device == "cpu":
-        time_stats = run_cpu_benchmark(args, config)
+        time_stats, model_params = run_cpu_benchmark(args, config)
     else:
-        # run with up to args.n_gpus (i.e., 4) GPUs in parallel (configurable via --n-gpus)
-        time_stats = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
-   
+        time_stats, model_params = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
+
+
     austin_tz = ZoneInfo("America/Chicago")
     current_time = datetime.now(austin_tz)
     experiment_folder = f"experiment_{current_time.strftime('%Y%m%d_%H%M%S')}"
@@ -241,6 +258,7 @@ def main():
         "env": summarize_env(),
         "system": get_system_info(),
         "config": vars(args),
+        "moel_params": model_params,
     }
 
     summary_json = f"{args.out_dir}/{args.device}_benchmark_summary.json"

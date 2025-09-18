@@ -1,5 +1,6 @@
 
-import time, gc
+import time, gc, sys, os
+import json
 
 import xgboost as xgb
 from sklearn.model_selection import StratifiedShuffleSplit
@@ -8,6 +9,39 @@ import platform
 import psutil
 import cpuinfo
 import GPUtil
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+@dataclass
+class Metrics:
+    data_time_s: Optional[float] = None
+    full_train_total_s: Optional[float] = None
+    boost_step_estm_s: Optional[float] = None # estimated time for one boosting step
+    n_boost_per_sec: Optional[float] = None
+    boost_step_avg_s: Optional[float] = None 
+    boost_step_s_std: Optional[float] = None
+    boost_step_s_median: Optional[float] = None
+    n_boost_per_sec_avg: Optional[float] = None
+    n_boost_per_sec_std: Optional[float] = None
+    n_boost_per_sec_median: Optional[float] = None
+    test_accuracy: Optional[float] = None
+    train_logloss: Optional[float] = None
+    test_logloss: Optional[float] = None
+
+    def to_dict(self, drop_none: bool = True) -> dict:
+        d = asdict(self)
+        return {k: v for k, v in d.items() if v is not None} if drop_none else d
+
+
+def summarize_env():
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "xgboost": xgb.__version__,
+        "omp_threads_env": os.environ.get("OMP_NUM_THREADS"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
 
 def make_synthetic_binary(
     n_samples: int,
@@ -48,13 +82,6 @@ def make_synthetic_binary(
         y = y[perm]
 
     return X, y
-
-def build_dmatrix(X, y):
-    t0 = time.perf_counter()
-    dtrain = xgb.DMatrix(X, label=y)
-    t1 = time.perf_counter()
-    return dtrain, t1 - t0
-
 
 
 def build_train_test_dmatrices(
@@ -102,6 +129,34 @@ def build_train_test_dmatrices(
     return dtrain, dtest, times
 
 
+def ensure_data_and_split(
+        x_path, 
+        y_path, 
+        train_idx_path, 
+        test_idx_path, 
+        config):
+    
+    if not (x_path.exists() and y_path.exists()):
+        X, y = make_synthetic_binary(n_samples=config.sample.n_samples, n_features=config.sample.n_features, seed=config.sample.random_state, shuffle=True)
+        np.save(x_path, X, allow_pickle=False)
+        np.save(y_path, y, allow_pickle=False)
+        del X, y
+        gc.collect()
+
+    # single fixed stratified split (same seed), saved once
+    if not (train_idx_path.exists() and test_idx_path.exists()):
+        y = np.load(y_path, mmap_mode="r")
+        sss = StratifiedShuffleSplit(n_splits=1, 
+                                     test_size=config.sample.test_size, 
+                                     random_state=config.sample.random_state)
+        
+        train_idx, test_idx = next(sss.split(np.zeros_like(y), y))
+        np.save(train_idx_path, train_idx.astype(np.int32, copy=False), allow_pickle=False)
+        np.save(test_idx_path,  test_idx.astype(np.int32, copy=False), allow_pickle=False)
+        del y, train_idx, test_idx
+        gc.collect()
+
+
 def get_system_info():
     info = {}
 
@@ -147,3 +202,55 @@ def get_system_info():
         info["GPU Info"] = f"Could not retrieve GPU info ({e})"
 
     return info
+
+
+
+def _smart_cast(v: str):
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s == "true":  return True
+        if s == "false": return False
+        if s in ("null", "none"): return None
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            try:
+                return int(s)
+            except Exception:
+                pass
+        try:
+            if any(c in s for c in ".e"):
+                return float(s)
+        except Exception:
+            pass
+    return v
+
+def _flatten(obj, out=None):
+    if out is None:
+        out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _flatten(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _flatten(item, out)
+    else:
+        # use only the last part of the key path → no prefix
+        out_key = str(obj)  # fallback if needed
+    return out
+
+def flatten_xgb_config(booster: xgb.Booster) -> dict:
+    cfg = json.loads(booster.save_config())
+    out = {}
+
+    def recurse(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, (dict, list)):
+                    recurse(v)
+                else:
+                    out[k] = _smart_cast(v)
+        elif isinstance(node, list):
+            for item in node:
+                recurse(item)
+
+    recurse(cfg)
+    return out
