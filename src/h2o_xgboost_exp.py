@@ -84,6 +84,8 @@ def h2o_map_params(args, config):
         "scale_pos_weight": config.common.scale_pos_weight,
         "sample_rate": config.common.subsample,
         "quiet_mode": True if config.common.verbosity == 0 else False,
+        "tree_method": config.gpu.tree_method if args.device == "gpu" else config.cpu.tree_method,
+        # "min_split_loss": config.common.min_split_loss,
         "nthread": args.threads,
         "backend": "gpu" if args.device == "gpu" else "cpu",
         "gpu_id": 0 # this will be 0 for these experiments since we explore one gpu at a time in this experiment
@@ -107,6 +109,7 @@ def run_training_once(params, train, num_boost_round=None):
     """
 
     if num_boost_round is not None:
+        params = params.copy()
         params["ntrees"] = num_boost_round # we will do one tree at a time
 
     t0 = time.perf_counter()
@@ -129,7 +132,7 @@ def h2o_one_run(
     params = h2o_map_params(args, config)
 
     # warmup run
-    _ = run_training_once(params, train, num_boost_round=2)
+    _ = run_training_once(params, train, num_boost_round=5)
 
     # main training run
     gc_was_enabled = gc.isenabled()

@@ -9,7 +9,7 @@ def get_config():
     config.label = None
 
     config.sample = ConfigDict()
-    config.sample.n_samples = 1_000
+    config.sample.n_samples = 1_000_000
     config.sample.n_features = 20
     config.sample.random_state = 42
     config.sample.test_size = 0.2
@@ -34,6 +34,7 @@ def get_config():
     config.common.max_leaves = 0
     config.common.max_bin = 256
     config.common.num_boost_round = 100
+    config.common.min_split_loss = 0.0
 
     config.common.verbosity = 0
 
