@@ -1,24 +1,27 @@
-
-import time, gc, sys, os
+import gc
 import json
-
-import xgboost as xgb
-from sklearn.model_selection import StratifiedShuffleSplit
-import numpy as np
+import os
 import platform
-import psutil
+import sys
+import time
+from dataclasses import asdict, dataclass
+from typing import Optional
+
 import cpuinfo
 import GPUtil
-from dataclasses import dataclass, asdict
-from typing import Optional
+import numpy as np
+import psutil
+import xgboost as xgb
+from sklearn.model_selection import StratifiedShuffleSplit
+
 
 @dataclass
 class Metrics:
     data_time_s: Optional[float] = None
     full_train_total_s: Optional[float] = None
-    boost_step_estm_s: Optional[float] = None # estimated time for one boosting step
+    boost_step_estm_s: Optional[float] = None  # estimated time for one boosting step
     n_boost_per_sec: Optional[float] = None
-    boost_step_avg_s: Optional[float] = None 
+    boost_step_avg_s: Optional[float] = None
     boost_step_s_std: Optional[float] = None
     boost_step_s_median: Optional[float] = None
     n_boost_per_sec_avg: Optional[float] = None
@@ -42,6 +45,7 @@ def summarize_env():
         "omp_threads_env": os.environ.get("OMP_NUM_THREADS"),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
+
 
 def make_synthetic_binary(
     n_samples: int,
@@ -68,14 +72,17 @@ def make_synthetic_binary(
     n_b = n_samples - n_a
     rng = np.random.default_rng(seed)
 
-    Xa = rng.normal(mean_a, std_a, size=(n_a, n_features)).astype(np.float32, copy=False)
-    Xb = rng.normal(mean_b, std_b, size=(n_b, n_features)).astype(np.float32, copy=False)
+    Xa = rng.normal(mean_a, std_a, size=(n_a, n_features)).astype(
+        np.float32, copy=False
+    )
+    Xb = rng.normal(mean_b, std_b, size=(n_b, n_features)).astype(
+        np.float32, copy=False
+    )
     X = np.vstack([Xa, Xb])
     y = np.empty(n_samples, dtype=np.uint8)
     y[:n_a] = 0
     y[n_a:] = 1
 
-    
     if shuffle:
         perm = rng.permutation(n_samples)
         X = X[perm]
@@ -89,7 +96,7 @@ def build_train_test_dmatrices(
     y,
     test_pct: float = 0.2,
     seed: int = 42,
-    gpu: bool = False # set True if you will use tree_method="gpu_hist"
+    gpu: bool = False,  # set True if you will use tree_method="gpu_hist"
 ):
     """
     Returns: dtrain, dtest, times
@@ -113,31 +120,33 @@ def build_train_test_dmatrices(
         dtrain = xgb.DMatrix(X[train_idx], label=y[train_idx])
     times["dmatrix_train_s"] = time.perf_counter() - t0
     n_train = int(train_idx.size)
-    del train_idx; gc.collect()
+    del train_idx
+    gc.collect()
 
     # Build test DMatrix
     t0 = time.perf_counter()
     dtest = xgb.DMatrix(X[test_idx], label=y[test_idx])
     times["dmatrix_test_s"] = time.perf_counter() - t0
     n_test = int(test_idx.size)
-    del test_idx; gc.collect()
+    del test_idx
+    gc.collect()
 
     times["n_train"] = n_train
     times["n_test"] = n_test
     times["test_pct"] = float(test_pct)
-    
+
     return dtrain, dtest, times
 
 
-def ensure_data_and_split(
-        x_path, 
-        y_path, 
-        train_idx_path, 
-        test_idx_path, 
-        config):
-    
+def ensure_data_and_split(x_path, y_path, train_idx_path, test_idx_path, config):
+
     if not (x_path.exists() and y_path.exists()):
-        X, y = make_synthetic_binary(n_samples=config.sample.n_samples, n_features=config.sample.n_features, seed=config.sample.random_state, shuffle=True)
+        X, y = make_synthetic_binary(
+            n_samples=config.sample.n_samples,
+            n_features=config.sample.n_features,
+            seed=config.sample.random_state,
+            shuffle=True,
+        )
         np.save(x_path, X, allow_pickle=False)
         np.save(y_path, y, allow_pickle=False)
         del X, y
@@ -146,13 +155,19 @@ def ensure_data_and_split(
     # single fixed stratified split (same seed), saved once
     if not (train_idx_path.exists() and test_idx_path.exists()):
         y = np.load(y_path, mmap_mode="r")
-        sss = StratifiedShuffleSplit(n_splits=1, 
-                                     test_size=config.sample.test_size, 
-                                     random_state=config.sample.random_state)
-        
+        sss = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=config.sample.test_size,
+            random_state=config.sample.random_state,
+        )
+
         train_idx, test_idx = next(sss.split(np.zeros_like(y), y))
-        np.save(train_idx_path, train_idx.astype(np.int32, copy=False), allow_pickle=False)
-        np.save(test_idx_path,  test_idx.astype(np.int32, copy=False), allow_pickle=False)
+        np.save(
+            train_idx_path, train_idx.astype(np.int32, copy=False), allow_pickle=False
+        )
+        np.save(
+            test_idx_path, test_idx.astype(np.int32, copy=False), allow_pickle=False
+        )
         del y, train_idx, test_idx
         gc.collect()
 
@@ -204,13 +219,15 @@ def get_system_info():
     return info
 
 
-
 def _smart_cast(v: str):
     if isinstance(v, str):
         s = v.strip().lower()
-        if s == "true":  return True
-        if s == "false": return False
-        if s in ("null", "none"): return None
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+        if s in ("null", "none"):
+            return None
         if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
             try:
                 return int(s)
@@ -222,6 +239,7 @@ def _smart_cast(v: str):
         except Exception:
             pass
     return v
+
 
 def _flatten(obj, out=None):
     if out is None:
@@ -236,6 +254,7 @@ def _flatten(obj, out=None):
         # use only the last part of the key path → no prefix
         out_key = str(obj)  # fallback if needed
     return out
+
 
 def flatten_xgb_config(booster: xgb.Booster) -> dict:
     cfg = json.loads(booster.save_config())
@@ -254,3 +273,12 @@ def flatten_xgb_config(booster: xgb.Booster) -> dict:
 
     recurse(cfg)
     return out
+
+
+def format_number(n: int) -> str:
+    suffixes = ["", "K", "M", "B", "T", "P"]  # extend as needed
+    i = 0
+    while abs(n) >= 1000 and i < len(suffixes) - 1:
+        n /= 1000.0
+        i += 1
+    return f"{n:.0f}{suffixes[i]}"

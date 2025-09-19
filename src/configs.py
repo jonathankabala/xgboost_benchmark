@@ -13,10 +13,10 @@ def get_config():
     config.sample.n_features = 20
     config.sample.random_state = 42
     config.sample.test_size = 0.2
-    
+
     config.common = ConfigDict()
     config.common.booster = "gbtree"
-    config.common.objective = 'binary:logistic'
+    config.common.objective = "binary:logistic"
     config.common.eta = 0.3
     config.common.gamma = 0.0
     config.common.max_depth = 6
@@ -40,10 +40,12 @@ def get_config():
 
     config.cpu = ConfigDict()
     config.cpu.device = None  # Use default CPU
-    config.cpu.tree_method = 'hist'
+    config.cpu.tree_method = "hist"
 
     config.gpu = ConfigDict()
-    config.gpu.device = 0 # i don't use this for now and set a device in the code if using gpu passed in the argparse
-    config.gpu.tree_method = 'hist' # gpu_hist is deprecated for newer version of xgboost
+    config.gpu.device = 0  # i don't use this for now and set a device in the code if using gpu passed in the argparse
+    config.gpu.tree_method = (
+        "hist"  # gpu_hist is deprecated for newer version of xgboost
+    )
 
     return config

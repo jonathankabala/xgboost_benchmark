@@ -3,41 +3,36 @@ import argparse
 import gc
 import json
 import os
-import sys
-import psutil
-import time
 import platform
-from pathlib import Path
-from tqdm import tqdm
-from multiprocessing import get_context
+import sys
+import time
 from datetime import datetime
+from multiprocessing import get_context
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-
+import h2o
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, log_loss
+import psutil
 import xgboost as xgb
-import h2o
-
+from sklearn.metrics import accuracy_score, log_loss
+from tqdm import tqdm
 
 from configs import get_config
-
-from pyxboost_exp import py_one_run
 from h2o_xgboost_exp import h2o_one_run
-from utils import (
-    get_system_info,
-    summarize_env
-)
+from pyxboost_exp import py_one_run
+from utils import format_number, get_system_info, summarize_env
 
 
 def _ensure_h2o():
     try:
         # connects to a running cluster at default http://localhost:54321
-        h2o.connect()  
+        h2o.connect()
     except Exception:
         # if nothing is running yet, start one
         h2o.init(ip="localhost", port=54321)
+
 
 def cpu_worker(q, args, config):
     """
@@ -68,7 +63,7 @@ def cpu_worker(q, args, config):
     time.sleep(0.2)  # tiny settle
 
     if args.experiment_type == "h2oxgboost":
-        _ensure_h2o() # i just want to connect to the parent cluster that I started with h2o.init()
+        _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
 
     if args.experiment_type == "pyxgboost":
         times, model_params = py_one_run(args=args, config=config)
@@ -78,6 +73,7 @@ def cpu_worker(q, args, config):
         raise ValueError(f"unknown experiment type {args.experiment_type}")
 
     q.put((times, model_params))
+
 
 def gpu_worker(q, args, config, gpu_id: int):
     """
@@ -100,7 +96,9 @@ def gpu_worker(q, args, config, gpu_id: int):
 
     # clone args minimally without mutating parent
     # we don't need argparse.Namespace here—just change the device view.
-    class A: pass
+    class A:
+        pass
+
     args_local = A()
     for k, v in vars(args).items():
         setattr(args_local, k, v)
@@ -109,7 +107,7 @@ def gpu_worker(q, args, config, gpu_id: int):
     time.sleep(0.2)
 
     if args.experiment_type == "h2oxgboost":
-        _ensure_h2o() # i just want to connect to the parent cluster that I started with h2o.init()
+        _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
 
     if args.experiment_type == "pyxgboost":
         times, model_params = py_one_run(args=args_local, config=config)
@@ -118,6 +116,7 @@ def gpu_worker(q, args, config, gpu_id: int):
     else:
         raise ValueError(f"unknown experiment type {args.experiment_type}")
     q.put((times, model_params))
+
 
 def run_cpu_benchmark(args, config):
     if args.device == "cpu":
@@ -138,6 +137,7 @@ def run_cpu_benchmark(args, config):
             pbar.update(1)
 
     return time_stats, model_params
+
 
 def run_gpu_benchmark(args, config, num_gpus: int = 4):
     """
@@ -169,7 +169,9 @@ def run_gpu_benchmark(args, config, num_gpus: int = 4):
             result, model_params = q.get()  # wait for that worker
             p.join()
             if p.exitcode != 0:
-                raise SystemExit(f"GPU run on device {gid} failed with exit code {p.exitcode}")
+                raise SystemExit(
+                    f"GPU run on device {gid} failed with exit code {p.exitcode}"
+                )
             time_stats.append(result)
             pbar.update(1)
 
@@ -180,37 +182,56 @@ def run_gpu_benchmark(args, config, num_gpus: int = 4):
 
     return time_stats, model_params
 
+
 def main():
 
-    parser = argparse.ArgumentParser(description="XGBoost CPU and single-GPU timing benchmark")
-    parser.add_argument("--experiment-type", choices=["pyxgboost", "h2oxgboost"], default="pyxgboost")
+    t0 = time.perf_counter()
+
+    parser = argparse.ArgumentParser(
+        description="XGBoost CPU and single-GPU timing benchmark"
+    )
+    parser.add_argument(
+        "--experiment-type", choices=["pyxgboost", "h2oxgboost"], default="pyxgboost"
+    )
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
 
-    parser.add_argument("--out-dir", type=str, default="logs_dev", help="output directory")
     parser.add_argument(
-        "--load-data",
-        action="store_true",
-        help="load data instead of creating it"
+        "--out-dir", type=str, default="logs_dev", help="output directory"
+    )
+    parser.add_argument(
+        "--load-data", action="store_true", help="load data instead of creating it"
     )
 
     parser.add_argument(
-        "--data-dir",
-        type=str,
-        default="data",
-        help="directory to load data from"
+        "--data-dir", type=str, default="data", help="directory to load data from"
     )
 
     parser.add_argument("--n-runs", type=int, default=5, help="number of runs")
     parser.add_argument("--threads", type=int, default=5, help="threads per CPU run")
 
-    parser.add_argument("--core-start", type=int, default=0,
-                        help="first core index to pin the worker+threads (CPU only)")
-    parser.add_argument("--isolate-blas", action="store_true",
-                        help="force single-thread BLAS during DMatrix prep (CPU only)")
-    parser.add_argument("--nice", type=int, default=None,
-                        help="set process niceness (lower is higher priority)")
-    parser.add_argument("--n-gpus", type=int, default=4,
-                        help="number of GPUs to use concurrently for GPU mode")
+    parser.add_argument(
+        "--core-start",
+        type=int,
+        default=0,
+        help="first core index to pin the worker+threads (CPU only)",
+    )
+    parser.add_argument(
+        "--isolate-blas",
+        action="store_true",
+        help="force single-thread BLAS during DMatrix prep (CPU only)",
+    )
+    parser.add_argument(
+        "--nice",
+        type=int,
+        default=None,
+        help="set process niceness (lower is higher priority)",
+    )
+    parser.add_argument(
+        "--n-gpus",
+        type=int,
+        default=4,
+        help="number of GPUs to use concurrently for GPU mode",
+    )
 
     args = parser.parse_args()
     config = get_config()
@@ -234,27 +255,34 @@ def main():
 
     # import ipdb
     # ipdb.set_trace()
-    
+
     if args.device == "cpu":
         time_stats, model_params = run_cpu_benchmark(args, config)
     else:
         time_stats, model_params = run_gpu_benchmark(args, config, num_gpus=args.n_gpus)
 
+    t1 = time.perf_counter()
+    total_run_time = t1 - t0
 
     austin_tz = ZoneInfo("America/Chicago")
     current_time = datetime.now(austin_tz)
-    experiment_folder = f"experiment_{current_time.strftime('%Y%m%d_%H%M%S')}"
+    experiment_folder = f"{args.device}_{format_number(config.sample.n_samples)}_{current_time.strftime('%Y%m%d_%H%M%S')}"
 
     args.out_dir = Path(args.out_dir) / args.experiment_type / experiment_folder
-    args.out_dir.mkdir(parents=True, exist_ok=True) 
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame(time_stats)
-    benchmark_detailed_file = f"{args.out_dir}/{args.device}_benchmark_detailed_times.csv"
+    benchmark_detailed_file = (
+        f"{args.out_dir}/{args.device}_benchmark_detailed_times.csv"
+    )
     df.to_csv(benchmark_detailed_file, index=False)
 
-     # report and persist summary
-    args.out_dir = str(args.out_dir) # since I am saving this to json, args.out_dir needs to be str not Path
+    # report and persist summary
+    args.out_dir = str(
+        args.out_dir
+    )  # since I am saving this to json, args.out_dir needs to be str not Path
     summary = {
+        "total_time": total_run_time,
         "env": summarize_env(),
         "system": get_system_info(),
         "config": vars(args),
@@ -267,6 +295,7 @@ def main():
 
     print(f"wrote summary to {summary_json}")
     print(f"wrote per-run details to {benchmark_detailed_file}")
+
 
 if __name__ == "__main__":
     main()
