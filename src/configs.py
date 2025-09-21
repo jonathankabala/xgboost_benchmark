@@ -9,7 +9,7 @@ def get_config():
     config.label = None
 
     config.sample = ConfigDict()
-    config.sample.n_samples = 10_000_000
+    config.sample.n_samples = 100_000_000
     config.sample.n_features = 20
     config.sample.random_state = 42
     config.sample.test_size = 0.2
