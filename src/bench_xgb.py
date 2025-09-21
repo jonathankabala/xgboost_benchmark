@@ -3,6 +3,7 @@ import argparse
 import gc
 import json
 import os
+os.environ["H2O_JAR_PATH"] = "/home/h2o/h2o-3.46.0.7/h2o.jar"
 import platform
 import sys
 import time
@@ -25,13 +26,56 @@ from pyxboost_exp import py_one_run
 from utils import format_number, get_system_info, summarize_env
 
 
-def _ensure_h2o():
-    try:
-        # connects to a running cluster at default http://localhost:54321
-        h2o.connect()
-    except Exception:
-        # if nothing is running yet, start one
-        h2o.init(ip="localhost", port=54321)
+# def _ensure_h2o():
+#     try:
+#         # connects to a running cluster at default http://localhost:54321
+#         h2o.connect()
+#     except Exception:
+#         # if nothing is running yet, start one
+#         h2o.init(ip="localhost", port=54321)
+
+def _init_h2o_isolated(gpu_id: int | None = None):
+    """
+    Start a fresh, private H2O cluster in this process with a port band that
+    won't overlap with other workers. Space bands by 100 ports.
+    """
+    import tempfile, uuid, time as _time
+    import h2o, os
+
+    tmp_root = tempfile.mkdtemp(prefix=f"h2o_{os.getpid()}_")
+
+    # Reserve wide, non-overlapping bands to avoid H2O's internal port scanning collisions.
+    # GPU workers: fixed by gid (e.g., 55100, 55200, 55300, 55400)
+    # CPU workers: put them in a separate band (56000+) if you ever run H2O on CPU.
+    if gpu_id is not None:
+        band_base = 55100 + gpu_id * 100
+    else:
+        band_base = 56000 + (os.getpid() % 10) * 100  # unlikely to collide
+
+    name = f"bench_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+    # H2O can take a couple seconds to come up; give it ample room.
+    last_err = None
+    for delta in range(0, 50):  # 50 ports in this worker's private band
+        port = band_base + delta
+        try:
+            h2o.init(
+                ip="127.0.0.1",
+                port=port,
+                name=name,
+                ice_root=tmp_root,
+                bind_to_localhost=True,
+                strict_version_check=False,
+                # min_mem_size="1g",
+                # max_mem_size="4g",
+            )
+            # h2o.no_progress()
+            return
+        except Exception as e:
+            last_err = e
+            _time.sleep(0.25)  # give the JVM time to bind before trying next port
+    raise RuntimeError(f"Failed to start isolated H2O cluster after retries: {last_err}")
+
 
 
 def cpu_worker(q, args, config):
@@ -62,43 +106,100 @@ def cpu_worker(q, args, config):
 
     time.sleep(0.2)  # tiny settle
 
-    if args.experiment_type == "h2oxgboost":
-        _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
+    # if args.experiment_type == "h2oxgboost":
+    #     _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
 
-    if args.experiment_type == "pyxgboost":
-        times, model_params = py_one_run(args=args, config=config)
-    elif args.experiment_type == "h2oxgboost":
-        times, model_params = h2o_one_run(args=args, config=config)
-    else:
-        raise ValueError(f"unknown experiment type {args.experiment_type}")
+    # if args.experiment_type == "pyxgboost":
+    #     times, model_params = py_one_run(args=args, config=config)
+    # elif args.experiment_type == "h2oxgboost":
+    #     times, model_params = h2o_one_run(args=args, config=config)
+    # else:
+    #     raise ValueError(f"unknown experiment type {args.experiment_type}")
 
-    q.put((times, model_params))
+    # q.put((times, model_params))
 
+    time.sleep(0.2)  # tiny settle
+
+    try:
+        if args.experiment_type == "h2oxgboost":
+            # start a private H2O cluster just for THIS process
+            _init_h2o_isolated(gpu_id=None)
+
+        if args.experiment_type == "pyxgboost":
+            times, model_params = py_one_run(args=args, config=config)
+        elif args.experiment_type == "h2oxgboost":
+            times, model_params = h2o_one_run(args=args, config=config)
+        else:
+            raise ValueError(f"unknown experiment type {args.experiment_type}")
+
+        q.put((times, model_params))
+    finally:
+        if args.experiment_type == "h2oxgboost":
+            try:
+                import h2o
+                h2o.remove_all()
+                h2o.cluster().shutdown()
+            except Exception:
+                pass
+
+
+# def gpu_worker(q, args, config, gpu_id: int):
+#     """
+#     GPU worker. hard-isolate to a single GPU via CUDA_VISIBLE_DEVICES.
+#     inside this process, that GPU is ordinal 0; we set params['device']='cuda:0'.
+#     """
+#     # stable device ordering + hard isolation
+#     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+#     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+#     # avoid cross-GPU fabric probing (we're single-GPU per process)
+#     os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+#     os.environ.setdefault("NCCL_IB_DISABLE", "1")
+
+#     # set niceness if requested
+#     try:
+#         if args.nice is not None:
+#             psutil.Process(os.getpid()).nice(args.nice)
+#     except Exception:
+#         pass
+
+#     # clone args minimally without mutating parent
+#     # we don't need argparse.Namespace here—just change the device view.
+#     class A:
+#         pass
+
+#     args_local = A()
+#     for k, v in vars(args).items():
+#         setattr(args_local, k, v)
+#     args_local.device = "gpu"
+
+#     time.sleep(0.2)
+
+#     if args.experiment_type == "h2oxgboost":
+#         _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
+
+#     if args.experiment_type == "pyxgboost":
+#         times, model_params = py_one_run(args=args_local, config=config)
+#     elif args.experiment_type == "h2oxgboost":
+#         times, model_params = h2o_one_run(args=args_local, config=config)
+#     else:
+#         raise ValueError(f"unknown experiment type {args.experiment_type}")
+#     q.put((times, model_params))
 
 def gpu_worker(q, args, config, gpu_id: int):
-    """
-    GPU worker. hard-isolate to a single GPU via CUDA_VISIBLE_DEVICES.
-    inside this process, that GPU is ordinal 0; we set params['device']='cuda:0'.
-    """
-    # stable device ordering + hard isolation
+    # isolate GPU
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    # avoid cross-GPU fabric probing (we're single-GPU per process)
     os.environ.setdefault("NCCL_P2P_DISABLE", "1")
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
 
-    # set niceness if requested
     try:
         if args.nice is not None:
             psutil.Process(os.getpid()).nice(args.nice)
     except Exception:
         pass
 
-    # clone args minimally without mutating parent
-    # we don't need argparse.Namespace here—just change the device view.
-    class A:
-        pass
-
+    # clone args without mutation and mark as GPU
+    class A: ...
     args_local = A()
     for k, v in vars(args).items():
         setattr(args_local, k, v)
@@ -106,16 +207,28 @@ def gpu_worker(q, args, config, gpu_id: int):
 
     time.sleep(0.2)
 
-    if args.experiment_type == "h2oxgboost":
-        _ensure_h2o()  # i just want to connect to the parent cluster that I started with h2o.init()
+    try:
+        if args.experiment_type == "h2oxgboost":
+            # Private H2O cluster bound to localhost & unique port
+            _init_h2o_isolated(gpu_id=gpu_id)
 
-    if args.experiment_type == "pyxgboost":
-        times, model_params = py_one_run(args=args_local, config=config)
-    elif args.experiment_type == "h2oxgboost":
-        times, model_params = h2o_one_run(args=args_local, config=config)
-    else:
-        raise ValueError(f"unknown experiment type {args.experiment_type}")
-    q.put((times, model_params))
+        if args.experiment_type == "pyxgboost":
+            times, model_params = py_one_run(args=args_local, config=config)
+        elif args.experiment_type == "h2oxgboost":
+            times, model_params = h2o_one_run(args=args_local, config=config)
+        else:
+            raise ValueError(f"unknown experiment type {args.experiment_type}")
+
+        q.put((times, model_params))
+    finally:
+        if args.experiment_type == "h2oxgboost":
+            try:
+                import h2o
+                h2o.remove_all()
+                h2o.cluster().shutdown()
+            except Exception:
+                pass
+
 
 
 def run_cpu_benchmark(args, config):
@@ -236,8 +349,8 @@ def main():
     args = parser.parse_args()
     config = get_config()
 
-    if args.experiment_type == "h2oxgboost":
-        h2o.init()
+    # if args.experiment_type == "h2oxgboost":
+    #     h2o.init()
 
     # py_one_run(args=args, config=config)
 
@@ -286,7 +399,7 @@ def main():
         "env": summarize_env(),
         "system": get_system_info(),
         "config": vars(args),
-        "moel_params": model_params,
+        "model_params": model_params,
     }
 
     summary_json = f"{args.out_dir}/{args.device}_benchmark_summary.json"
